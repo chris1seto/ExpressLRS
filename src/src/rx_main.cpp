@@ -154,20 +154,7 @@ int8_t debug4 = 0;
 
 bool InBindingMode = false;
 
-
-typedef struct crsfPayloadLinkstatistics_s
-{
-    uint8_t uplink_RSSI_1;
-    uint8_t uplink_RSSI_2;
-    uint8_t uplink_Link_quality;
-    int8_t uplink_SNR;
-    uint8_t active_antenna;
-    uint8_t rf_Mode;
-    uint8_t uplink_TX_Power;
-    uint8_t downlink_RSSI;
-    uint8_t downlink_Link_quality;
-    int8_t downlink_SNR;
-} crsfLinkStatistics_t;
+OtaSwitchMode_e OtaSwitchModeCurrent;
 
 crsfLinkStatistics_t link_stats = {0};
 
@@ -176,6 +163,59 @@ void EnterBindingMode();
 void ExitBindingMode();
 void UpdateModelMatch(uint8_t model);
 void OnELRSBindMSP(uint8_t* packet);
+
+uint16_t channel_data[24] = {0};
+
+void ProcessRcData(const uint8_t* ota)
+{
+  // The analog channels
+  channel_data[0] = (ota[1] << 3) | ((ota[5] & 0b11000000) >> 5);
+  channel_data[1]  = (ota[2] << 3) | ((ota[5] & 0b00110000) >> 3);
+  channel_data[2]  = (ota[3] << 3) | ((ota[5] & 0b00001100) >> 1);
+  channel_data[3] = (ota[4] << 3) | ((ota[5] & 0b00000011) << 1);
+  
+  switch (OtaSwitchModeCurrent)
+  {
+    case sm1Bit:
+      Serial.println('1');
+      break;
+    case smHybrid:
+      Serial.println('2');
+      break;
+    case smHybridWide:
+      Serial.println('3');
+      break;
+    default:
+      Serial.println('4');
+      break;
+  }
+}
+
+void OutputSpektrum(void)
+{
+  uint8_t tx_buffer[2 + 14];
+  uint32_t packet_ptr = 0;
+  uint32_t i;
+  
+  /*
+    0x03
+    0x01
+    (7 channels, 2 bytes each = 14 total bytes of channel data)
+      * First byte contains the channel ID
+      * Second byte contains the channel data
+  */
+  
+  tx_buffer[packet_ptr++] = 0x03;
+  tx_buffer[packet_ptr++] = 0x01;
+  
+  for (i = 0; i < 7; i++)
+  {
+    tx_buffer[packet_ptr++] = (i << 3) | 0;
+    tx_buffer[packet_ptr++] = 0;
+  }
+  
+  Serial.write(tx_buffer, sizeof(tx_buffer));
+}
 
 static uint8_t minLqForChaos()
 {
@@ -191,6 +231,35 @@ static uint8_t minLqForChaos()
     const uint32_t numfhss = FHSSgetChannelCount();
     const uint8_t interval = ExpressLRS_currAirRate_Modparams->FHSShopInterval;
     return interval * ((interval * numfhss + 99) / (interval * numfhss));
+}
+
+void ICACHE_RAM_ATTR getRFlinkInfo()
+{
+    int32_t rssiDBM0 = LPF_UplinkRSSI0.SmoothDataINT;
+    int32_t rssiDBM1 = LPF_UplinkRSSI1.SmoothDataINT;
+    switch (antenna) {
+        case 0:
+            rssiDBM0 = LPF_UplinkRSSI0.update(Radio.LastPacketRSSI);
+            break;
+        case 1:
+            rssiDBM1 = LPF_UplinkRSSI1.update(Radio.LastPacketRSSI);
+            break;
+    }
+
+    int32_t rssiDBM = (antenna == 0) ? rssiDBM0 : rssiDBM1;
+
+    if (rssiDBM0 > 0) rssiDBM0 = 0;
+    if (rssiDBM1 > 0) rssiDBM1 = 0;
+
+    // BetaFlight/iNav expect positive values for -dBm (e.g. -80dBm -> sent as 80)
+    link_stats.uplink_RSSI_1 = -rssiDBM0;
+    link_stats.active_antenna = antenna;
+    link_stats.uplink_SNR = Radio.LastPacketSNR;
+    link_stats.rf_Mode = (uint8_t)RATE_4HZ - (uint8_t)ExpressLRS_currAirRate_Modparams->enum_rate;
+    link_stats.downlink_RSSI = 0;
+    link_stats.downlink_Link_quality = 0;
+    link_stats.downlink_SNR = 0;
+    link_stats.uplink_RSSI_2 = -rssiDBM1;
 }
 
 
@@ -254,10 +323,10 @@ bool ICACHE_RAM_ATTR HandleSendTelemetryResponse()
         // The value in linkstatistics is "positivized" (inverted polarity)
         // and must be inverted on the TX side. Positive values are used
         // so save a bit to encode which antenna is in use
-        Radio.TXdataBuffer[2] = crsf.LinkStatistics.uplink_RSSI_1 | (antenna << 7);
-        Radio.TXdataBuffer[3] = crsf.LinkStatistics.uplink_RSSI_2 | (connectionHasModelMatch << 7);
-        Radio.TXdataBuffer[4] = crsf.LinkStatistics.uplink_SNR;
-        Radio.TXdataBuffer[5] = crsf.LinkStatistics.uplink_Link_quality;
+        Radio.TXdataBuffer[2] = link_stats.uplink_RSSI_1 | (antenna << 7);
+        Radio.TXdataBuffer[3] = link_stats.uplink_RSSI_2 | (connectionHasModelMatch << 7);
+        Radio.TXdataBuffer[4] = link_stats.uplink_SNR;
+        Radio.TXdataBuffer[5] = link_stats.uplink_Link_quality;
         Radio.TXdataBuffer[6] = MspReceiver.GetCurrentConfirm() ? 1 : 0;
 
         NextTelemetryType = ELRS_TELEMETRY_TYPE_DATA;
@@ -377,7 +446,7 @@ void ICACHE_RAM_ATTR HWtimerCallbackTick() // this is 180 out of phase with the 
 
     // Save the LQ value before the inc() reduces it by 1
     uplinkLQ = LQCalc.getLQ();
-    crsf.LinkStatistics.uplink_Link_quality = uplinkLQ;
+    link_stats.uplink_Link_quality = uplinkLQ;
     // Only advance the LQI period counter if we didn't send Telemetry this period
     if (!alreadyTLMresp)
         LQCalc.inc();
@@ -560,15 +629,7 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_RC()
     if (connectionState != connected)
         return;
 
-    bool telemetryConfirmValue = UnpackChannelData(Radio.RXdataBuffer, &crsf,
-        NonceRX, TLMratioEnumToValue(ExpressLRS_currAirRate_Modparams->TLMinterval));
-    TelemetrySender.ConfirmCurrentPayload(telemetryConfirmValue);
-
-    // No channels packets to the FC if no model match
-    if (connectionHasModelMatch)
-    {
-      ////// send packet
-    }
+  ProcessRcData((uint8_t*)&Radio.RXdataBuffer);
 }
 
 /**
@@ -590,18 +651,12 @@ static void ICACHE_RAM_ATTR MspReceiveComplete()
         if (connectionHasModelMatch)
         {
             crsf_ext_header_t *receivedHeader = (crsf_ext_header_t *) MspData;
-            if ((receivedHeader->dest_addr == CRSF_ADDRESS_BROADCAST || receivedHeader->dest_addr == CRSF_ADDRESS_FLIGHT_CONTROLLER))
-            {
-                crsf.sendMSPFrameToFC(MspData);
-            }
 
             if ((receivedHeader->dest_addr == CRSF_ADDRESS_BROADCAST || receivedHeader->dest_addr == CRSF_ADDRESS_CRSF_RECEIVER))
             {
                 if (MspData[CRSF_TELEMETRY_TYPE_INDEX] == CRSF_FRAMETYPE_DEVICE_PING)
                 {
                     uint8_t deviceInformation[DEVICE_INFORMATION_LENGTH];
-                    crsf.GetDeviceInformation(deviceInformation, 0);
-                    crsf.SetExtendedHeaderAndCrc(deviceInformation, CRSF_FRAMETYPE_DEVICE_INFO, DEVICE_INFORMATION_FRAME_SIZE, CRSF_ADDRESS_CRSF_RECEIVER, CRSF_ADDRESS_CRSF_TRANSMITTER);
                     telemetry.AppendTelemetryPackage(deviceInformation);
                 }
             }
@@ -658,7 +713,7 @@ static bool ICACHE_RAM_ATTR ProcessRfPacket_SYNC(uint32_t now)
     // Will change the packet air rate in loop() if this changes
     ExpressLRS_nextAirRateIndex = (Radio.RXdataBuffer[3] & 0b11000000) >> 6;
     // Update switch mode encoding immediately
-    OtaSetSwitchMode((OtaSwitchMode_e)((Radio.RXdataBuffer[3] & 0b00000110) >> 1));
+    OtaSwitchModeCurrent = ((OtaSwitchMode_e)((Radio.RXdataBuffer[3] & 0b00000110) >> 1));
     // Update TLM ratio
     expresslrs_tlm_ratio_e TLMrateIn = (expresslrs_tlm_ratio_e)((Radio.RXdataBuffer[3] & 0b00111000) >> 3);
     if (ExpressLRS_currAirRate_Modparams->TLMinterval != TLMrateIn)
@@ -749,6 +804,7 @@ void ICACHE_RAM_ATTR ProcessRFPacket()
     }
 
     // Store the LQ/RSSI/Antenna
+    getRFlinkInfo();
     // Received a packet, that's the definition of LQ
     LQCalc.add();
     // Extend sync duration since we've received a packet at this rate
@@ -778,53 +834,7 @@ void ICACHE_RAM_ATTR TXdoneISR()
 
 static void setupSerial()
 {
-#if defined(CRSF_RCVR_NO_SERIAL)
-    // For PWM receivers with no CRSF I/O, only turn on the Serial port if logging is on
-    #if defined(DEBUG_LOG)
-    Serial.begin(RCVR_UART_BAUD);
-    #endif
-    return;
-#endif
-
-#ifdef PLATFORM_STM32
-#if defined(TARGET_R9SLIMPLUS_RX)
-    CRSF_RX_SERIAL.setRx(GPIO_PIN_RCSIGNAL_RX);
-    CRSF_RX_SERIAL.begin(RCVR_UART_BAUD);
-
-    CRSF_TX_SERIAL.setTx(GPIO_PIN_RCSIGNAL_TX);
-#else /* !TARGET_R9SLIMPLUS_RX */
-    CRSF_TX_SERIAL.setTx(GPIO_PIN_RCSIGNAL_TX);
-    CRSF_TX_SERIAL.setRx(GPIO_PIN_RCSIGNAL_RX);
-#endif /* TARGET_R9SLIMPLUS_RX */
-#if defined(TARGET_RX_GHOST_ATTO_V1)
-    // USART1 is used for RX (half duplex)
-    CRSF_RX_SERIAL.setHalfDuplex();
-    CRSF_RX_SERIAL.setTx(GPIO_PIN_RCSIGNAL_RX);
-    CRSF_RX_SERIAL.begin(RCVR_UART_BAUD);
-    CRSF_RX_SERIAL.enableHalfDuplexRx();
-
-    // USART2 is used for TX (half duplex)
-    // Note: these must be set before begin()
-    CRSF_TX_SERIAL.setHalfDuplex();
-    CRSF_TX_SERIAL.setRx((PinName)NC);
-    CRSF_TX_SERIAL.setTx(GPIO_PIN_RCSIGNAL_TX);
-#endif /* TARGET_RX_GHOST_ATTO_V1 */
-    CRSF_TX_SERIAL.begin(RCVR_UART_BAUD);
-#endif /* PLATFORM_STM32 */
-
-#if defined(TARGET_RX_FM30_MINI)
-    Serial.setRx(GPIO_PIN_DEBUG_RX);
-    Serial.setTx(GPIO_PIN_DEBUG_TX);
-    Serial.begin(RCVR_UART_BAUD); // Same baud as CRSF for simplicity
-#endif
-
-#if defined(PLATFORM_ESP8266)
-    Serial.begin(RCVR_UART_BAUD);
-    #if defined(RCVR_INVERT_TX)
-    USC0(UART0) |= BIT(UCTXI);
-    #endif
-#endif
-
+  Serial.begin(115200);
 }
 
 static void setupConfigAndPocCheck()
@@ -879,36 +889,6 @@ static void setupBindingFromConfig()
         }
         DBGLN("UID = %d, %d, %d, %d, %d, %d", UID[0], UID[1], UID[2], UID[3], UID[4], UID[5]);
         CRCInitializer = (UID[4] << 8) | UID[5];
-    }
-#endif
-}
-
-static void HandleUARTin()
-{
-#if !defined(CRSF_RCVR_NO_SERIAL)
-    while (CRSF_RX_SERIAL.available())
-    {
-        telemetry.RXhandleUARTin(CRSF_RX_SERIAL.read());
-
-        if (telemetry.ShouldCallBootloader())
-        {
-            reset_into_bootloader();
-        }
-        if (telemetry.ShouldCallEnterBind())
-        {
-            EnterBindingMode();
-        }
-        if (telemetry.ShouldCallUpdateModelMatch())
-        {
-            UpdateModelMatch(telemetry.GetUpdatedModelMatch());
-        }
-        if (telemetry.ShouldSendDeviceFrame())
-        {
-            uint8_t deviceInformation[DEVICE_INFORMATION_LENGTH];
-            crsf.GetDeviceInformation(deviceInformation, 0);
-            crsf.SetExtendedHeaderAndCrc(deviceInformation, CRSF_FRAMETYPE_DEVICE_INFO, DEVICE_INFORMATION_FRAME_SIZE, CRSF_ADDRESS_CRSF_RECEIVER, CRSF_ADDRESS_FLIGHT_CONTROLLER);
-            crsf.sendMSPFrameToFC(deviceInformation);
-        }
     }
 #endif
 }
@@ -1144,8 +1124,7 @@ struct bootloader {
 
 void reset_into_bootloader(void)
 {
-    CRSF_TX_SERIAL.println((const char *)&target_name[4]);
-    CRSF_TX_SERIAL.flush();
+
 #if defined(PLATFORM_STM32)
     delay(100);
     DBGLN("Jumping to Bootloader...");
