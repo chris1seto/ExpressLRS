@@ -75,35 +75,6 @@ unsigned long rebootTime = 0;
 extern bool webserverPreventAutoStart;
 #endif
 
-#if defined(GPIO_PIN_PWM_OUTPUTS)
-#include <Servo.h>
-static constexpr uint8_t SERVO_PINS[] = GPIO_PIN_PWM_OUTPUTS;
-static constexpr uint8_t SERVO_COUNT = ARRAY_SIZE(SERVO_PINS);
-static Servo *Servos[SERVO_COUNT];
-static bool newChannelsAvailable;
-#endif
-
-/* CRSF_TX_SERIAL is used by CRSF output */
-#if defined(TARGET_RX_FM30_MINI)
-    HardwareSerial CRSF_TX_SERIAL(USART2);
-#else
-    #define CRSF_TX_SERIAL Serial
-#endif
-CRSF crsf(CRSF_TX_SERIAL);
-
-/* CRSF_RX_SERIAL is used by telemetry receiver and can be on a different peripheral */
-#if defined(TARGET_RX_GHOST_ATTO_V1) /* !TARGET_RX_GHOST_ATTO_V1 */
-    #define CRSF_RX_SERIAL CrsfRxSerial
-    HardwareSerial CrsfRxSerial(USART1, HALF_DUPLEX_ENABLED);
-#elif defined(TARGET_R9SLIMPLUS_RX) /* !TARGET_R9SLIMPLUS_RX */
-    #define CRSF_RX_SERIAL CrsfRxSerial
-    HardwareSerial CrsfRxSerial(USART3);
-#elif defined(TARGET_RX_FM30_MINI)
-    #define CRSF_RX_SERIAL CRSF_TX_SERIAL
-#else
-    #define CRSF_RX_SERIAL Serial
-#endif
-
 StubbornSender TelemetrySender(ELRS_TELEMETRY_MAX_PACKAGES);
 static uint8_t telemetryBurstCount;
 static uint8_t telemetryBurstMax;
@@ -183,6 +154,23 @@ int8_t debug4 = 0;
 
 bool InBindingMode = false;
 
+
+typedef struct crsfPayloadLinkstatistics_s
+{
+    uint8_t uplink_RSSI_1;
+    uint8_t uplink_RSSI_2;
+    uint8_t uplink_Link_quality;
+    int8_t uplink_SNR;
+    uint8_t active_antenna;
+    uint8_t rf_Mode;
+    uint8_t uplink_TX_Power;
+    uint8_t downlink_RSSI;
+    uint8_t downlink_Link_quality;
+    int8_t downlink_SNR;
+} crsfLinkStatistics_t;
+
+crsfLinkStatistics_t link_stats = {0};
+
 void reset_into_bootloader(void);
 void EnterBindingMode();
 void ExitBindingMode();
@@ -205,46 +193,6 @@ static uint8_t minLqForChaos()
     return interval * ((interval * numfhss + 99) / (interval * numfhss));
 }
 
-void ICACHE_RAM_ATTR getRFlinkInfo()
-{
-    int32_t rssiDBM0 = LPF_UplinkRSSI0.SmoothDataINT;
-    int32_t rssiDBM1 = LPF_UplinkRSSI1.SmoothDataINT;
-    switch (antenna) {
-        case 0:
-            rssiDBM0 = LPF_UplinkRSSI0.update(Radio.LastPacketRSSI);
-            break;
-        case 1:
-            rssiDBM1 = LPF_UplinkRSSI1.update(Radio.LastPacketRSSI);
-            break;
-    }
-
-    int32_t rssiDBM = (antenna == 0) ? rssiDBM0 : rssiDBM1;
-    crsf.PackedRCdataOut.ch15 = UINT10_to_CRSF(map(constrain(rssiDBM, ExpressLRS_currAirRate_RFperfParams->RXsensitivity, -50),
-                                               ExpressLRS_currAirRate_RFperfParams->RXsensitivity, -50, 0, 1023));
-    crsf.PackedRCdataOut.ch14 = UINT10_to_CRSF(fmap(uplinkLQ, 0, 100, 0, 1023));
-
-    if (rssiDBM0 > 0) rssiDBM0 = 0;
-    if (rssiDBM1 > 0) rssiDBM1 = 0;
-
-    // BetaFlight/iNav expect positive values for -dBm (e.g. -80dBm -> sent as 80)
-    crsf.LinkStatistics.uplink_RSSI_1 = -rssiDBM0;
-    crsf.LinkStatistics.active_antenna = antenna;
-    crsf.LinkStatistics.uplink_SNR = Radio.LastPacketSNR;
-    //crsf.LinkStatistics.uplink_Link_quality = uplinkLQ; // handled in Tick
-    crsf.LinkStatistics.rf_Mode = (uint8_t)RATE_4HZ - (uint8_t)ExpressLRS_currAirRate_Modparams->enum_rate;
-    //DBGLN(crsf.LinkStatistics.uplink_RSSI_1);
-    #if defined(DEBUG_BF_LINK_STATS)
-    crsf.LinkStatistics.downlink_RSSI = debug1;
-    crsf.LinkStatistics.downlink_Link_quality = debug2;
-    crsf.LinkStatistics.downlink_SNR = debug3;
-    crsf.LinkStatistics.uplink_RSSI_2 = debug4;
-    #else
-    crsf.LinkStatistics.downlink_RSSI = 0;
-    crsf.LinkStatistics.downlink_Link_quality = 0;
-    crsf.LinkStatistics.downlink_SNR = 0;
-    crsf.LinkStatistics.uplink_RSSI_2 = -rssiDBM1;
-    #endif
-}
 
 void SetRFLinkRate(uint8_t index) // Set speed of RF link
 {
@@ -436,7 +384,6 @@ void ICACHE_RAM_ATTR HWtimerCallbackTick() // this is 180 out of phase with the 
 
     alreadyTLMresp = false;
     alreadyFHSS = false;
-    crsf.RXhandleUARTout();
 }
 
 //////////////////////////////////////////////////////////////
@@ -620,11 +567,7 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_RC()
     // No channels packets to the FC if no model match
     if (connectionHasModelMatch)
     {
-        #if defined(GPIO_PIN_PWM_OUTPUTS)
-        newChannelsAvailable = true;
-        #else
-        crsf.sendRCFrameToFC();
-        #endif
+      ////// send packet
     }
 }
 
@@ -806,7 +749,6 @@ void ICACHE_RAM_ATTR ProcessRFPacket()
     }
 
     // Store the LQ/RSSI/Antenna
-    getRFlinkInfo();
     // Received a packet, that's the definition of LQ
     LQCalc.add();
     // Extend sync duration since we've received a packet at this rate
@@ -1039,10 +981,7 @@ static void cycleRfMode(unsigned long now)
         // Display the current air rate to the user as an indicator something is happening
         INFOLN("%d", ExpressLRS_currAirRate_Modparams->interval);
         scanIndex++;
-        getRFlinkInfo();
-        crsf.sendLinkStatisticsToFC();
         delay(100);
-        crsf.sendLinkStatisticsToFC(); // need to send twice, not sure why, seems like a BF bug?
         Radio.RXnb();
 
         // Switch to FAST_SYNC if not already in it (won't be if was just connected)
@@ -1052,58 +991,6 @@ static void cycleRfMode(unsigned long now)
 
 static void servosUpdate(unsigned long now)
 {
-#if defined(GPIO_PIN_PWM_OUTPUTS)
-    // The ESP waveform generator is nice because it doesn't change the value
-    // mid-cycle, but it does busywait if there's already a change queued.
-    // Updating every 20ms minimizes the amount of waiting (0-800us cycling
-    // after it syncs up) where 19ms always gets a 1000-1800us wait cycling
-    static uint32_t lastUpdate;
-    const uint32_t elapsed = now - lastUpdate;
-    if (elapsed < 20)
-        return;
-
-    if (newChannelsAvailable)
-    {
-        newChannelsAvailable = false;
-        for (uint8_t ch=0; ch<SERVO_COUNT; ++ch)
-        {
-            const rx_config_pwm_t *chConfig = config.GetPwmChannel(ch);
-            uint16_t us = CRSF_to_US(crsf.GetChannelOutput(chConfig->val.inputChannel));
-            if (chConfig->val.inverted)
-                us = 3000U - us;
-
-            if (Servos[ch])
-                Servos[ch]->writeMicroseconds(us);
-            else if (us >= 988U && us <= 2012U)
-            {
-                // us might be out of bounds if this is a switch channel and it has not been
-                // received yet. Delay initializing the servo until the channel is valid
-                Servo *servo = new Servo();
-                Servos[ch] = servo;
-                servo->attach(SERVO_PINS[ch], 988U, 2012U, us);
-            }
-        } /* for each servo */
-    } /* if newChannelsAvailable */
-
-    else if (elapsed > 1000U && connectionState == connected)
-    {
-        // No update for 1s, go to failsafe
-        for (uint8_t ch=0; ch<SERVO_COUNT; ++ch)
-        {
-            // Note: Failsafe values do not respect the inverted flag, failsafes are absolute
-            uint16_t us = config.GetPwmChannel(ch)->val.failsafe + 988U;
-            if (Servos[ch])
-                Servos[ch]->writeMicroseconds(us);
-        }
-    }
-
-    else
-        return; // prevent updating lastUpdate
-
-    // need to sample actual millis at the end to account for any
-    // waiting that happened in Servo::writeMicroseconds()
-    lastUpdate = millis();
-#endif
 }
 
 static void updateBindingMode()
@@ -1179,7 +1066,6 @@ void setup()
 
         MspReceiver.SetDataToReceive(ELRS_MSP_BUFFER, MspData, ELRS_MSP_BYTES_PER_CALL);
         Radio.RXnb();
-        crsf.Begin();
         hwTimer.init();
     }
 
@@ -1189,11 +1075,6 @@ void setup()
 void loop()
 {
     unsigned long now = millis();
-    HandleUARTin();
-    if (hwTimer.running == false)
-    {
-        crsf.RXhandleUARTout();
-    }
 
     devicesUpdate(now);
 
@@ -1214,8 +1095,6 @@ void loop()
         LostConnection();
         LastSyncPacket = now;           // reset this variable to stop rf mode switching and add extra time
         RFmodeLastCycled = now;         // reset this variable to stop rf mode switching and add extra time
-        crsf.sendLinkStatisticsToFC();
-        crsf.sendLinkStatisticsToFC(); // need to send twice, not sure why, seems like a BF bug?
     }
 
     if (connectionState == tentative && (now - LastSyncPacket > ExpressLRS_currAirRate_RFperfParams->RxLockTimeoutMs))
@@ -1241,18 +1120,6 @@ void loop()
         GotConnection(now);
     }
 
-    if (now > (SendLinkStatstoFCintervalLastSent + SEND_LINK_STATS_TO_FC_INTERVAL))
-    {
-        if (connectionState == disconnected)
-        {
-            getRFlinkInfo();
-        }
-        if (connectionState != disconnected && connectionHasModelMatch)
-        {
-            crsf.sendLinkStatisticsToFC();
-            SendLinkStatstoFCintervalLastSent = now;
-        }
-    }
 
     if ((RXtimerState == tim_tentative) && ((now - GotConnectionMillis) > ConsiderConnGoodMillis) && (abs(OffsetDx) <= 5))
     {
