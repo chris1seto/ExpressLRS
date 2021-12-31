@@ -164,38 +164,14 @@ void ExitBindingMode();
 void UpdateModelMatch(uint8_t model);
 void OnELRSBindMSP(uint8_t* packet);
 
-uint16_t channel_data[24] = {0};
-
-void ProcessRcData(const uint8_t* ota)
-{
-  // The analog channels
-  channel_data[0] = (ota[1] << 3) | ((ota[5] & 0b11000000) >> 5);
-  channel_data[1]  = (ota[2] << 3) | ((ota[5] & 0b00110000) >> 3);
-  channel_data[2]  = (ota[3] << 3) | ((ota[5] & 0b00001100) >> 1);
-  channel_data[3] = (ota[4] << 3) | ((ota[5] & 0b00000011) << 1);
-  
-  switch (OtaSwitchModeCurrent)
-  {
-    case sm1Bit:
-      Serial.println('1');
-      break;
-    case smHybrid:
-      Serial.println('2');
-      break;
-    case smHybridWide:
-      Serial.println('3');
-      break;
-    default:
-      Serial.println('4');
-      break;
-  }
-}
+float channel_data[CRSF_NUM_CHANNELS] = {0};
 
 void OutputSpektrum(void)
 {
   uint8_t tx_buffer[2 + 14];
   uint32_t packet_ptr = 0;
   uint32_t i;
+  uint16_t temp;
   
   /*
     0x03
@@ -208,14 +184,62 @@ void OutputSpektrum(void)
   tx_buffer[packet_ptr++] = 0x03;
   tx_buffer[packet_ptr++] = 0x01;
   
+  // From the Pathpoint code
+  //uint16_t result = (channelData.ChannelItem[channel-1].Value * 0.586 + 900);
+  
   for (i = 0; i < 7; i++)
   {
-    tx_buffer[packet_ptr++] = (i << 3) | 0;
-    tx_buffer[packet_ptr++] = 0;
+    temp = (uint16_t)(1500.0f + (channel_data[i] / 4));
+    tx_buffer[packet_ptr++] = ((i + 1) << 3) | ((temp >> 8) & 0b00000111);
+    tx_buffer[packet_ptr++] = temp;
   }
   
   Serial.write(tx_buffer, sizeof(tx_buffer));
 }
+
+#define CRSF_SCALE_TO_PM1000 1.21951219512f
+void ProcessRcData(const uint8_t* ota)
+{
+  uint16_t raw_channel_data[CRSF_NUM_CHANNELS];
+  uint32_t i;
+
+  /*
+    Throttle 1
+    Steering 2
+    waypoint 4
+    mode 6
+  */
+  
+  // The analog channels
+  // 172 to 1810, center = 992
+  // 820 lower
+  // 818
+  raw_channel_data[0] = (ota[1] << 3) | ((ota[5] & 0b11000000) >> 5); //
+  raw_channel_data[1]  = (ota[2] << 3) | ((ota[5] & 0b00110000) >> 3);
+  raw_channel_data[4]  = (ota[3] << 3) | ((ota[5] & 0b00001100) >> 1);
+  raw_channel_data[6] = (ota[4] << 3) | ((ota[5] & 0b00000011) << 1);
+
+  for (i = 0; i < CRSF_NUM_CHANNELS; i++)
+  {
+    channel_data[i] = ((float)raw_channel_data[i] - (float)CRSF_CHANNEL_VALUE_MID) * CRSF_SCALE_TO_PM1000;
+  }
+
+  switch (OtaSwitchModeCurrent)
+  {
+    case sm1Bit:
+      break;
+    case smHybrid:
+      // This one
+      break;
+    case smHybridWide:
+      break;
+    default:
+      break;
+  }
+  
+  OutputSpektrum();
+}
+
 
 static uint8_t minLqForChaos()
 {
@@ -1026,8 +1050,6 @@ void setup()
     setupSerial();
     // Init EEPROM and load config, checking powerup count
     setupConfigAndPocCheck();
-
-    INFOLN("ExpressLRS Module Booting...");
 
     devicesInit(ui_devices, ARRAY_SIZE(ui_devices));
     setupBindingFromConfig();
