@@ -166,13 +166,40 @@ void OnELRSBindMSP(uint8_t* packet);
 
 float channel_data[CRSF_NUM_CHANNELS] = {0};
 
+void print_channel(uint8_t highByte, uint8_t lowByte)
+{
+  uint8_t targetChannel = 0;
+  uint16_t channel_data;
+  float final_val;
+
+// Sanity checks
+  if (highByte&0b10000000)
+  {
+    Serial.println('*1');
+  }
+
+  // Compute the target channel to update
+  targetChannel = (highByte & 0b01111000) >> 3;
+
+  if (targetChannel<=0)
+  {
+Serial.println('*2');
+  }
+
+  channel_data = ((highByte & 0b00000111) << 8) | lowByte;
+
+  final_val = (channel_data * 0.586 + 900);
+
+  Serial.println(final_val);
+}
+
 void OutputSpektrum(void)
 {
   uint8_t tx_buffer[2 + 14];
   uint32_t packet_ptr = 0;
   uint32_t i;
   uint16_t temp;
-  
+
   /*
     0x03
     0x01
@@ -180,20 +207,26 @@ void OutputSpektrum(void)
       * First byte contains the channel ID
       * Second byte contains the channel data
   */
-  
+
   tx_buffer[packet_ptr++] = 0x03;
   tx_buffer[packet_ptr++] = 0x01;
-  
+
   // From the Pathpoint code
   //uint16_t result = (channelData.ChannelItem[channel-1].Value * 0.586 + 900);
-  
+
   for (i = 0; i < 7; i++)
   {
-    temp = (uint16_t)(1500.0f + (channel_data[i] / 4));
+    // Spektrum is centered up at 1023, +/- 854. This gets turned into ~1.0mS to ~2.0mS
+    temp = (uint16_t)(1023.0f + (channel_data[i] * (854.0f / 1000.0f)));
     tx_buffer[packet_ptr++] = ((i + 1) << 3) | ((temp >> 8) & 0b00000111);
     tx_buffer[packet_ptr++] = temp;
+
+    /*if (i == 0)
+    {
+      print_channel(tx_buffer[2],  tx_buffer[3]);
+    }*/
   }
-  
+
   Serial.write(tx_buffer, sizeof(tx_buffer));
 }
 
@@ -202,6 +235,9 @@ void ProcessRcData(const uint8_t* ota)
 {
   uint16_t raw_channel_data[CRSF_NUM_CHANNELS];
   uint32_t i;
+  uint8_t switchByte;
+  uint8_t switchIndex;
+  uint16_t switchValue;
 
   /*
     Throttle 1
@@ -209,34 +245,70 @@ void ProcessRcData(const uint8_t* ota)
     waypoint 4
     mode 6
   */
-  
+
   // The analog channels
   // 172 to 1810, center = 992
   // 820 lower
   // 818
-  raw_channel_data[0] = (ota[1] << 3) | ((ota[5] & 0b11000000) >> 5); //
+  raw_channel_data[0] = (ota[1] << 3) | ((ota[5] & 0b11000000) >> 5);
   raw_channel_data[1]  = (ota[2] << 3) | ((ota[5] & 0b00110000) >> 3);
-  raw_channel_data[4]  = (ota[3] << 3) | ((ota[5] & 0b00001100) >> 1);
-  raw_channel_data[6] = (ota[4] << 3) | ((ota[5] & 0b00000011) << 1);
-
-  for (i = 0; i < CRSF_NUM_CHANNELS; i++)
-  {
-    channel_data[i] = ((float)raw_channel_data[i] - (float)CRSF_CHANNEL_VALUE_MID) * CRSF_SCALE_TO_PM1000;
-  }
+  raw_channel_data[2]  = (ota[3] << 3) | ((ota[5] & 0b00001100) >> 1);
+  raw_channel_data[3] = (ota[4] << 3) | ((ota[5] & 0b00000011) << 1);
 
   switch (OtaSwitchModeCurrent)
   {
     case sm1Bit:
       break;
     case smHybrid:
-      // This one
+      switchByte = ota[6];
+
+      // The low latency switch
+      raw_channel_data[4] = BIT_to_CRSF((switchByte & 0b01000000) >> 6);
+
+      // The round-robin switch, switchIndex is actually index-1
+      // to leave the low bit open for switch 7 (sent as 0b11x)
+      // where x is the high bit of switch 7
+      switchIndex = (switchByte & 0b111000) >> 3;
+      switchValue = SWITCH3b_to_CRSF(switchByte & 0b111);
+
+      switch (switchIndex)
+      {
+        case 0:
+            raw_channel_data[5] = switchValue;
+            break;
+        case 1:
+            raw_channel_data[6] = switchValue;
+            break;
+        case 2:
+            raw_channel_data[7] = switchValue;
+            break;
+        case 3:
+            raw_channel_data[8] = switchValue;
+            break;
+        case 4:
+            raw_channel_data[9] = switchValue;
+            break;
+        case 5:
+            raw_channel_data[10] = switchValue;
+            break;
+        case 6:   // Because AUX1 (index 0) is the low latency switch, the low bit
+        case 7:   // of the switchIndex can be used as data, and arrives as index "6"
+            raw_channel_data[11] = N_to_CRSF(switchByte & 0b1111, 15);
+            break;
+      }
+
       break;
     case smHybridWide:
       break;
     default:
       break;
   }
-  
+
+  for (i = 0; i < CRSF_NUM_CHANNELS; i++)
+  {
+    channel_data[i] = ((float)raw_channel_data[i] - (float)CRSF_CHANNEL_VALUE_MID) * CRSF_SCALE_TO_PM1000;
+  }
+
   OutputSpektrum();
 }
 
