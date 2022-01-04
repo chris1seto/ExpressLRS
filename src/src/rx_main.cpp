@@ -164,6 +164,8 @@ void ExitBindingMode();
 void UpdateModelMatch(uint8_t model);
 void OnELRSBindMSP(uint8_t* packet);
 
+uint16_t raw_channel_data[CRSF_NUM_CHANNELS];
+  
 float channel_data[CRSF_NUM_CHANNELS] = {0};
 
 #define INTERNAL_CONTROL_MIN -1000.0f
@@ -208,7 +210,7 @@ float CenterMap(const float x,
 
 void OutputSpektrum(void)
 {
-  uint16_t remapped_channel_data[7];
+  float remapped_channel_data[7];
   uint8_t tx_buffer[2 + 14];
   uint32_t packet_ptr = 0;
   uint32_t i;
@@ -248,6 +250,15 @@ void OutputSpektrum(void)
     temp = (uint16_t)CenterMap(remapped_channel_data[i],
       INTERNAL_CONTROL_MIN, 0, INTERNAL_CONTROL_MAX,
       170.648f, 1023.89f, 1877.13);
+      
+    /*if (i == 0)
+    {
+      Serial.print(remapped_channel_data[0]);
+      Serial.print(' ');
+      Serial.print(temp);
+      Serial.print(' ');
+      Serial.println((float)((float)temp * .586 + 900.0f));
+    }*/
     
     tx_buffer[packet_ptr++] = ((i + 1) << 3) | ((temp >> 8) & 0b00000111);
     tx_buffer[packet_ptr++] = temp;
@@ -258,7 +269,6 @@ void OutputSpektrum(void)
 
 void ProcessRcData(const uint8_t* ota)
 {
-  uint16_t raw_channel_data[CRSF_NUM_CHANNELS];
   uint32_t i;
   uint8_t switchByte;
   uint8_t switchIndex;
@@ -289,6 +299,7 @@ void ProcessRcData(const uint8_t* ota)
       // where x is the high bit of switch 7
       switchIndex = (switchByte & 0b111000) >> 3;
       switchValue = SWITCH3b_to_CRSF(switchByte & 0b111);
+      TelemetrySender.ConfirmCurrentPayload(!!(switchByte & (1 << 7)));
 
       switch (switchIndex)
       {
@@ -322,7 +333,7 @@ void ProcessRcData(const uint8_t* ota)
     default:
       break;
   }
-  
+
   for (i = 0; i < CRSF_NUM_CHANNELS; i++)
   {
     temp_channel = CenterMap(raw_channel_data[i],
@@ -1143,6 +1154,12 @@ void setup()
     // serial setup must be done before anything as some libs write
     // to the serial port and they'll block if the buffer fills
     setupSerial();
+    
+    for (uint32_t i = 0; i < CRSF_NUM_CHANNELS; i++)
+    {
+      raw_channel_data[i] = CRSF_CHANNEL_VALUE_MID;
+    }
+    
     // Init EEPROM and load config, checking powerup count
     setupConfigAndPocCheck();
 
